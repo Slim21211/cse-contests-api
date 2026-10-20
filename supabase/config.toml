@@ -1,0 +1,6 @@
+# Настройки Supabase CLI для функций этого репозитория.
+# project_id не обязателен для деплоя: проект задаётся флагом --project-ref.
+
+[functions.uploads]
+# Проверку делаем сами (VK ID), а не через Supabase Auth — JWT Supabase не требуется.
+verify_jwt = false
