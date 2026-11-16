@@ -6,7 +6,8 @@
   "description": "Supabase Edge Function для загрузки конкурсных работ в VK Cloud",
   "scripts": {
     "setup-bucket": "tsx scripts/setup-bucket.ts",
-    "deploy": "supabase functions deploy uploads --no-verify-jwt --use-api"
+    "deploy": "supabase functions deploy uploads --no-verify-jwt --use-api",
+    "cleanup-uploads": "tsx scripts/cleanup-uploads.ts"
   },
   "devDependencies": {
     "@aws-sdk/client-s3": "^3.1153.0",

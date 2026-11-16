@@ -77,6 +77,11 @@ npx supabase secrets set --env-file .env --project-ref <project-ref>
 **5. Сайт**
 Ничего настраивать не нужно: cse-contests-web по умолчанию обращается к `<VITE_SUPABASE_URL>/functions/v1`.
 
+**6. Очистка брошенных загрузок**
+Если связь оборвалась посреди загрузки, в бакете остаются части файла, которые занимают место. Правило lifecycle ключам VK Cloud недоступно, поэтому их раз в сутки (03:30 МСК) отменяет `.github/workflows/cleanup-uploads.yml`: всё незавершённое старше 2 суток. Готовые файлы не затрагиваются. Нужны секреты Actions `S3_ACCESS_KEY_ID` и `S3_SECRET_ACCESS_KEY` (те же, что в `.env`).
+
+Вручную: `npm run cleanup-uploads`, без изменений: `DRY_RUN=true npm run cleanup-uploads`.
+
 ## Логи и мониторинг
 
 Логи функции: панель Supabase → Edge Functions → uploads → Logs. Своего сервера нет, так что следить за падениями процесса не нужно, этим занимается Supabase.
@@ -89,6 +94,8 @@ npx supabase secrets set --env-file .env --project-ref <project-ref>
 supabase/functions/uploads/index.ts   функция целиком
 supabase/functions/uploads/deno.json  зависимости функции (aws4fetch — подпись запросов S3)
 supabase/config.toml                  verify_jwt = false: вход проверяем через VK, а не Supabase Auth
-scripts/setup-bucket.ts               CORS и автоочистка недогруженных файлов в бакете
+scripts/setup-bucket.ts               CORS бакета (и lifecycle, если хранилище разрешит)
+scripts/cleanup-uploads.ts            отмена брошенных незавершённых загрузок
 .github/workflows/deploy.yml          деплой функции
+.github/workflows/cleanup-uploads.yml ежедневный запуск cleanup-uploads
 ```

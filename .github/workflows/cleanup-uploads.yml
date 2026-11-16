@@ -1,0 +1,34 @@
+name: Cleanup abandoned uploads
+
+# Раз в сутки отменяет незавершённые загрузки старше 2 дней (см. scripts/cleanup-uploads.ts).
+# Готовые файлы не затрагиваются. Нужны секреты репозитория S3_ACCESS_KEY_ID и S3_SECRET_ACCESS_KEY.
+
+on:
+  schedule:
+    - cron: '30 0 * * *' # 03:30 по Москве
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Только показать, ничего не отменять'
+        type: boolean
+        default: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+      S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run cleanup-uploads
