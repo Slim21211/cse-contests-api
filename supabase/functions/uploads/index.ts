@@ -6,9 +6,13 @@
 //   POST /uploads/sign-parts   { key, uploadId, partNumbers }           → { parts }
 //   POST /uploads/complete     { key, uploadId, parts:[{partNumber,etag}] } → { publicUrl }
 //   POST /uploads/abort        { key, uploadId }                        → { ok }
+//   POST /uploads/session      {}                                       → { token, expiresAt }
 //   GET  /uploads/health                                                → { ok }
 //
 // Все POST требуют заголовок Authorization: Bearer <VK ID access token>.
+//
+// /session обменивает VK-токен на JWT для базы Supabase (role = authenticated,
+// claim vk_user_id). По нему RLS-политики понимают, кто делает запрос.
 
 import { AwsClient } from 'aws4fetch';
 
@@ -34,6 +38,9 @@ const config = {
   s3ForcePathStyle: env('S3_FORCE_PATH_STYLE', 'false') === 'true',
   maxFileSizeBytes: Number(env('MAX_FILE_SIZE_MB', '2048')) * 1024 * 1024,
   urlTtlSeconds: Number(env('UPLOAD_URL_TTL_SECONDS', String(6 * 60 * 60))),
+  /** Legacy JWT Secret проекта (Settings → JWT Keys). Пусто — /session отвечает 500, загрузки работают. */
+  dbJwtSecret: env('DB_JWT_SECRET', ''),
+  dbJwtTtlSeconds: Number(env('DB_JWT_TTL_SECONDS', '3600')),
 };
 
 const s3 = new AwsClient({
@@ -83,14 +90,26 @@ const safeName = (name: string) => {
   return `${cleaned || 'file'}.${ext}`;
 };
 
-/** Ключ «конкурс/vkId/время_имя»: завершить или отменить загрузку может только её автор. */
+/**
+ * Сезон — год, который встречаем: с июля уже следующий (конкурс декабря 2026 → 2027).
+ * То же правило, что festiveYear() на сайте и current_season() в базе. Время московское.
+ */
+const currentSeason = (now = new Date()) => {
+  const msk = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  return msk.getUTCMonth() >= 6 ? msk.getUTCFullYear() + 1 : msk.getUTCFullYear();
+};
+
+// Ключ «сезон/конкурс/vkId/время_имя.расш». Проверяем целиком: ровно 4 сегмента, последний
+// начинается с цифр — так что «..»-сегмента не бывает и после нормализации URL
+// запрос не уйдёт на чужой ключ.
+const KEY_RE = /^(\d{4})\/(child|team|individual)\/(\d+)\/\d+_[a-z0-9._-]+\.[a-z0-9]+$/;
+
+/** Завершить или отменить загрузку может только её автор. */
 const assertOwnKey = (key: unknown, userId: number): string => {
-  if (typeof key !== 'string') throw badRequest('Некорректный ключ файла');
-  const [contest, owner] = key.split('/');
-  if (!CONTESTS.includes(contest) || owner !== String(userId)) {
-    throw badRequest('Файл принадлежит другому пользователю');
-  }
-  return key;
+  const m = typeof key === 'string' ? KEY_RE.exec(key) : null;
+  if (!m) throw badRequest('Некорректный ключ файла');
+  if (m[3] !== String(userId)) throw badRequest('Файл принадлежит другому пользователю');
+  return key as string;
 };
 
 const assertUploadId = (uploadId: unknown): string => {
@@ -128,6 +147,58 @@ const requireVkUser = async (req: Request): Promise<number> => {
 
   tokenCache.set(token, { userId, expiresAt: Date.now() + 5 * 60 * 1000 });
   return userId;
+};
+
+// ---------- JWT для базы ----------
+
+const b64url = (data: Uint8Array | string) => {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+
+let hmacKey: Promise<CryptoKey> | null = null;
+const getHmacKey = () =>
+  (hmacKey ??= crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(config.dbJwtSecret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  ));
+
+/**
+ * Стабильный UUID из VK ID — для claim sub: встроенный auth.uid() приводит sub к uuid,
+ * и строка вида «vk:123» сломала бы любую политику, которая его вызовет.
+ */
+const vkSubject = async (userId: number) => {
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`vk:${userId}`)));
+  const h = [...hash.slice(0, 16)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+};
+
+const session = async (_body: Record<string, unknown>, userId: number) => {
+  if (!config.dbJwtSecret) {
+    console.error('DB_JWT_SECRET не задан');
+    throw new HttpError(500, 'not_configured', 'Вход временно недоступен');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + config.dbJwtTtlSeconds;
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const payload = b64url(
+    JSON.stringify({
+      iss: 'cse-contests',
+      aud: 'authenticated',
+      role: 'authenticated',
+      sub: await vkSubject(userId),
+      vk_user_id: userId,
+      iat: now,
+      exp,
+    })
+  );
+  const signature = await crypto.subtle.sign('HMAC', await getHmacKey(), new TextEncoder().encode(`${header}.${payload}`));
+  return { token: `${header}.${payload}.${b64url(new Uint8Array(signature))}`, expiresAt: exp * 1000 };
 };
 
 // ---------- S3 (VK Cloud) ----------
@@ -175,7 +246,7 @@ const start = async (body: Record<string, unknown>, userId: number) => {
     throw badRequest(`Файл больше ${Math.round(config.maxFileSizeBytes / 1024 / 1024)} МБ`);
   }
 
-  const key = `${contest}/${userId}/${Date.now()}_${safeName(fileName)}`;
+  const key = `${currentSeason()}/${contest}/${userId}/${Date.now()}_${safeName(fileName)}`;
   const partSize = Math.max(MIN_PART_SIZE, Math.ceil(size / MAX_PARTS / (1024 * 1024)) * 1024 * 1024);
   const partCount = Math.ceil(size / partSize);
 
@@ -262,6 +333,7 @@ const routes: Record<string, (body: Record<string, unknown>, userId: number) => 
   'sign-parts': signParts,
   complete,
   abort,
+  session,
 };
 
 // ---------- HTTP ----------

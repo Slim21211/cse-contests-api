@@ -23,7 +23,7 @@
 
 **Защита:**
 - VK-токен проверяется у `id.vk.com` вместе с нашим `client_id`;
-- ключ файла имеет вид `конкурс/vkId/время_имя.расширение`, поэтому завершить или отменить загрузку может только её автор;
+- ключ файла имеет вид `сезон/конкурс/vkId/время_имя.расширение` и проверяется целиком, поэтому завершить или отменить загрузку может только её автор;
 - разрешены только типы, которые показывает сайт (без html/svg/js — бакет публичный);
 - размер не больше `MAX_FILE_SIZE_MB`.
 
@@ -38,6 +38,7 @@
 | `POST /sign-parts` | `{ key, uploadId, partNumbers }` | `{ parts }` — новые ссылки взамен истёкших |
 | `POST /complete` | `{ key, uploadId, parts: [{ partNumber, etag }] }` | `{ publicUrl }` |
 | `POST /abort` | `{ key, uploadId }` | `{ ok }` |
+| `POST /session` | `{}` | `{ token, expiresAt }` — JWT для базы Supabase (`role: authenticated`, `vk_user_id`), подписан `DB_JWT_SECRET` |
 
 Все `POST` требуют заголовок `Authorization: Bearer <VK access token>`. `contest` принимает значения `child`, `team` или `individual`.
 
