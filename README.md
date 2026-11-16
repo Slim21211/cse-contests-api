@@ -24,8 +24,8 @@
 **Защита:**
 - VK-токен проверяется у `id.vk.com` вместе с нашим `client_id`;
 - ключ файла имеет вид `сезон/конкурс/vkId/время_имя.расширение` и проверяется целиком, поэтому завершить или отменить загрузку может только её автор;
-- разрешены только типы, которые показывает сайт (без html/svg/js — бакет публичный);
-- размер не больше `MAX_FILE_SIZE_MB`.
+- разрешены только типы, которые показывает сайт (без html/svg/js — бакет публичный); Content-Type задаёт сервер по расширению, документы и архивы отдаются с `Content-Disposition: attachment`;
+- размер не больше `MAX_FILE_SIZE_MB` и соблюдается хранилищем: заявленный размер записан в ключ (`…/время-размер_имя.расш`), а каждая ссылка подписана вместе с точным `Content-Length` своей части — лишний байт VK Cloud отклонит (403). Ссылки выдаются только на части, посчитанные при старте.
 
 ## API
 
@@ -34,7 +34,7 @@
 | Метод | Тело | Ответ |
 |---|---|---|
 | `GET /health` | — | `{ ok: true }` |
-| `POST /start` | `{ fileName, contentType, size, contest }` | `{ key, uploadId, partSize, parts: [{ partNumber, url }] }` |
+| `POST /start` | `{ fileName, size, contest }` | `{ key, uploadId, partSize, parts: [{ partNumber, url }] }` |
 | `POST /sign-parts` | `{ key, uploadId, partNumbers }` | `{ parts }` — новые ссылки взамен истёкших |
 | `POST /complete` | `{ key, uploadId, parts: [{ partNumber, etag }] }` | `{ publicUrl }` |
 | `POST /abort` | `{ key, uploadId }` | `{ ok }` |

@@ -2,7 +2,7 @@
 // частей файла прямо в VK Cloud и собирает файл после загрузки.
 // Сам файл через функцию не проходит, поэтому таймауты и лимиты размера ей не страшны.
 //
-//   POST /uploads/start        { fileName, contentType, size, contest } → { key, uploadId, partSize, parts }
+//   POST /uploads/start        { fileName, size, contest }              → { key, uploadId, partSize, parts }
 //   POST /uploads/sign-parts   { key, uploadId, partNumbers }           → { parts }
 //   POST /uploads/complete     { key, uploadId, parts:[{partNumber,etag}] } → { publicUrl }
 //   POST /uploads/abort        { key, uploadId }                        → { ok }
@@ -55,13 +55,44 @@ const s3 = new AwsClient({
 const CONTESTS = ['child', 'team', 'individual'];
 
 // Только типы, которые умеет показывать сайт. Никаких html/svg/js — бакет публичный.
-const ALLOWED_EXTENSIONS = new Set([
-  'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp',
-  'mp4', 'mov', 'webm', 'ogg', 'avi', 'mkv', 'm4v',
-  'mp3', 'wav', 'aac', 'oga', 'm4a',
-  'pdf', 'doc', 'docx', 'txt', 'rtf', 'ppt', 'pptx', 'xls', 'xlsx', 'csv',
-  'zip', 'rar', '7z',
-]);
+// Content-Type задаём сами по расширению: присланному браузером верить нельзя
+// (иначе .txt с text/html открылся бы из бакета как страница).
+// attachment — браузер скачивает файл, а не открывает его у себя.
+const FILE_TYPES: Record<string, { type: string; attachment?: true }> = {
+  jpg: { type: 'image/jpeg' },
+  jpeg: { type: 'image/jpeg' },
+  png: { type: 'image/png' },
+  gif: { type: 'image/gif' },
+  webp: { type: 'image/webp' },
+  heic: { type: 'image/heic' },
+  heif: { type: 'image/heif' },
+  bmp: { type: 'image/bmp' },
+  mp4: { type: 'video/mp4' },
+  mov: { type: 'video/quicktime' },
+  webm: { type: 'video/webm' },
+  ogg: { type: 'video/ogg' },
+  avi: { type: 'video/x-msvideo' },
+  mkv: { type: 'video/x-matroska' },
+  m4v: { type: 'video/x-m4v' },
+  mp3: { type: 'audio/mpeg' },
+  wav: { type: 'audio/wav' },
+  aac: { type: 'audio/aac' },
+  oga: { type: 'audio/ogg' },
+  m4a: { type: 'audio/mp4' },
+  pdf: { type: 'application/pdf' },
+  doc: { type: 'application/msword', attachment: true },
+  docx: { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', attachment: true },
+  txt: { type: 'text/plain; charset=utf-8', attachment: true },
+  rtf: { type: 'application/rtf', attachment: true },
+  ppt: { type: 'application/vnd.ms-powerpoint', attachment: true },
+  pptx: { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', attachment: true },
+  xls: { type: 'application/vnd.ms-excel', attachment: true },
+  xlsx: { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', attachment: true },
+  csv: { type: 'text/csv; charset=utf-8', attachment: true },
+  zip: { type: 'application/zip', attachment: true },
+  rar: { type: 'application/vnd.rar', attachment: true },
+  '7z': { type: 'application/x-7z-compressed', attachment: true },
+};
 
 const MIN_PART_SIZE = 8 * 1024 * 1024;
 const MAX_PARTS = 10_000;
@@ -99,17 +130,34 @@ const currentSeason = (now = new Date()) => {
   return msk.getUTCMonth() >= 6 ? msk.getUTCFullYear() + 1 : msk.getUTCFullYear();
 };
 
-// Ключ «сезон/конкурс/vkId/время_имя.расш». Проверяем целиком: ровно 4 сегмента, последний
-// начинается с цифр — так что «..»-сегмента не бывает и после нормализации URL
+// Ключ «сезон/конкурс/vkId/время-размер_имя.расш». Проверяем целиком: ровно 4 сегмента,
+// последний начинается с цифр — «..»-сегмента не бывает, и после нормализации URL
 // запрос не уйдёт на чужой ключ.
-const KEY_RE = /^(\d{4})\/(child|team|individual)\/(\d+)\/\d+_[a-z0-9._-]+\.[a-z0-9]+$/;
+// Размер в ключе — заявленный при старте. Ключ создаёт сервер, а uploadId в хранилище
+// привязан к ключу, поэтому подменить размер в последующих запросах нельзя.
+const KEY_RE = /^(\d{4})\/(child|team|individual)\/(\d+)\/\d+-(\d+)_[a-z0-9._-]+\.[a-z0-9]+$/;
 
-/** Завершить или отменить загрузку может только её автор. */
-const assertOwnKey = (key: unknown, userId: number): string => {
+/** Части по 8 МБ; для огромных файлов крупнее, чтобы уложиться в 10 000 частей. */
+const partSizeFor = (size: number) =>
+  Math.max(MIN_PART_SIZE, Math.ceil(size / MAX_PARTS / (1024 * 1024)) * 1024 * 1024);
+
+/** Точный размер части: каждая ссылка подписывается под него, больше в неё не положить. */
+const partLength = (size: number, partNumber: number) => {
+  const partSize = partSizeFor(size);
+  return Math.min(partSize, size - (partNumber - 1) * partSize);
+};
+
+/** Завершить, отменить или продлить загрузку может только её автор. */
+const parseOwnKey = (key: unknown, userId: number) => {
   const m = typeof key === 'string' ? KEY_RE.exec(key) : null;
   if (!m) throw badRequest('Некорректный ключ файла');
   if (m[3] !== String(userId)) throw badRequest('Файл принадлежит другому пользователю');
-  return key as string;
+  const size = Number(m[4]);
+  // Подделанный размер всё равно не пройдёт (uploadId привязан к настоящему ключу), но и лимит держим.
+  if (!Number.isSafeInteger(size) || size <= 0 || size > config.maxFileSizeBytes) {
+    throw badRequest('Некорректный ключ файла');
+  }
+  return { key: key as string, size, partCount: Math.ceil(size / partSizeFor(size)) };
 };
 
 const assertUploadId = (uploadId: unknown): string => {
@@ -223,12 +271,21 @@ const s3Error = async (res: Response, action: string) => {
   return new HttpError(502, 'storage_error', 'Ошибка хранилища, попробуйте ещё раз');
 };
 
-const signPart = async (key: string, uploadId: string, partNumber: number) => {
+/**
+ * Ссылка на загрузку одной части. Content-Length входит в подпись (allHeaders), поэтому
+ * хранилище примет ровно столько байт, сколько положено этой части (проверено на VK Cloud:
+ * иначе 403 SignatureDoesNotMatch). Браузер выставляет Content-Length сам по размеру Blob.
+ */
+const signPart = async (key: string, uploadId: string, partNumber: number, length: number) => {
   const url = new URL(objectUrl(key));
   url.searchParams.set('partNumber', String(partNumber));
   url.searchParams.set('uploadId', uploadId);
   url.searchParams.set('X-Amz-Expires', String(config.urlTtlSeconds));
-  const signed = await s3.sign(url.toString(), { method: 'PUT', aws: { signQuery: true } });
+  const signed = await s3.sign(url.toString(), {
+    method: 'PUT',
+    headers: { 'content-length': String(length) },
+    aws: { signQuery: true, allHeaders: true },
+  });
   return signed.url;
 };
 
@@ -237,23 +294,27 @@ const xmlEscape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').
 // ---------- обработчики ----------
 
 const start = async (body: Record<string, unknown>, userId: number) => {
-  const { fileName, contentType, size, contest } = body;
+  // contentType браузера не используем: тип задаём по расширению (FILE_TYPES).
+  const { fileName, size, contest } = body;
   if (typeof contest !== 'string' || !CONTESTS.includes(contest)) throw badRequest('Неизвестный конкурс');
   if (typeof fileName !== 'string' || !fileName || fileName.length > 255) throw badRequest('Некорректное имя файла');
-  if (!ALLOWED_EXTENSIONS.has(getExtension(fileName))) throw badRequest('Этот тип файла не поддерживается');
-  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) throw badRequest('Некорректный размер файла');
+  const fileType = FILE_TYPES[getExtension(fileName)];
+  if (!fileType) throw badRequest('Этот тип файла не поддерживается');
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size <= 0) throw badRequest('Некорректный размер файла');
   if (size > config.maxFileSizeBytes) {
     throw badRequest(`Файл больше ${Math.round(config.maxFileSizeBytes / 1024 / 1024)} МБ`);
   }
 
-  const key = `${currentSeason()}/${contest}/${userId}/${Date.now()}_${safeName(fileName)}`;
-  const partSize = Math.max(MIN_PART_SIZE, Math.ceil(size / MAX_PARTS / (1024 * 1024)) * 1024 * 1024);
+  const name = safeName(fileName);
+  const key = `${currentSeason()}/${contest}/${userId}/${Date.now()}-${size}_${name}`;
+  const partSize = partSizeFor(size);
   const partCount = Math.ceil(size / partSize);
 
   const res = await s3.fetch(`${objectUrl(key)}?uploads`, {
     method: 'POST',
     headers: {
-      'Content-Type': typeof contentType === 'string' && contentType ? contentType : 'application/octet-stream',
+      'Content-Type': fileType.type,
+      ...(fileType.attachment ? { 'Content-Disposition': `attachment; filename="${name}"` } : {}),
       'x-amz-acl': 'public-read',
     },
   });
@@ -262,39 +323,54 @@ const start = async (body: Record<string, unknown>, userId: number) => {
   if (!uploadId) throw new HttpError(502, 'storage_error', 'Хранилище не вернуло uploadId');
 
   const parts = await Promise.all(
-    Array.from({ length: partCount }, async (_, i) => ({ partNumber: i + 1, url: await signPart(key, uploadId, i + 1) }))
+    Array.from({ length: partCount }, async (_, i) => ({
+      partNumber: i + 1,
+      url: await signPart(key, uploadId, i + 1, partLength(size, i + 1)),
+    }))
   );
   console.log(`upload start: user=${userId} key=${key} size=${size} parts=${partCount}`);
   return { key, uploadId, partSize, parts };
 };
 
 const signParts = async (body: Record<string, unknown>, userId: number) => {
-  const key = assertOwnKey(body.key, userId);
+  const { key, size, partCount } = parseOwnKey(body.key, userId);
   const uploadId = assertUploadId(body.uploadId);
   const { partNumbers } = body;
+  // Только части, которые выдали при старте: больше заявленного размера не загрузить.
   if (
     !Array.isArray(partNumbers) ||
     partNumbers.length === 0 ||
-    partNumbers.length > MAX_PARTS ||
-    !partNumbers.every((n) => Number.isInteger(n) && n >= 1 && n <= MAX_PARTS)
+    partNumbers.length > partCount ||
+    !partNumbers.every((n) => Number.isInteger(n) && n >= 1 && n <= partCount)
   ) {
     throw badRequest('Некорректные номера частей');
   }
   const parts = await Promise.all(
-    (partNumbers as number[]).map(async (partNumber) => ({ partNumber, url: await signPart(key, uploadId, partNumber) }))
+    (partNumbers as number[]).map(async (partNumber) => ({
+      partNumber,
+      url: await signPart(key, uploadId, partNumber, partLength(size, partNumber)),
+    }))
   );
   return { parts };
 };
 
 const complete = async (body: Record<string, unknown>, userId: number) => {
-  const key = assertOwnKey(body.key, userId);
+  const { key, partCount } = parseOwnKey(body.key, userId);
   const uploadId = assertUploadId(body.uploadId);
   const { parts } = body;
   if (
     !Array.isArray(parts) ||
     parts.length === 0 ||
-    parts.length > MAX_PARTS ||
-    !parts.every((p) => Number.isInteger(p?.partNumber) && typeof p?.etag === 'string' && p.etag)
+    parts.length > partCount ||
+    !parts.every(
+      (p) =>
+        Number.isInteger(p?.partNumber) &&
+        p.partNumber >= 1 &&
+        p.partNumber <= partCount &&
+        typeof p?.etag === 'string' &&
+        p.etag &&
+        p.etag.length <= 200
+    )
   ) {
     throw badRequest('Некорректный список частей');
   }
@@ -321,7 +397,7 @@ const complete = async (body: Record<string, unknown>, userId: number) => {
 };
 
 const abort = async (body: Record<string, unknown>, userId: number) => {
-  const key = assertOwnKey(body.key, userId);
+  const { key } = parseOwnKey(body.key, userId);
   const uploadId = assertUploadId(body.uploadId);
   const res = await s3.fetch(`${objectUrl(key)}?uploadId=${encodeURIComponent(uploadId)}`, { method: 'DELETE' });
   if (!res.ok && res.status !== 404) throw await s3Error(res, 'Abort');
